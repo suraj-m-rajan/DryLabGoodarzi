@@ -1,0 +1,436 @@
+---
+title: "m^6^A Feature Exploration"
+author: "Mitchel Cole"
+date: "July 13, 2020"
+output:
+  html_document:
+    toc: no
+    toc_depth: 3
+    toc_float: yes
+    df_print: paged
+    code_folding: hide
+bibliography: ../references/papers.bib
+csl: ../references/nature.csl
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning=FALSE, message=FALSE, cache=TRUE, tidy=TRUE)
+```
+
+Compiled `r format(Sys.Date(), "%B %d, %Y")`
+
+# Intro
+
+The goal of this notebook is to predict m^6^ status of adenosines of
+transcripts based on genomic/genetic features. Previous studies have used ~100
+bp centered at the m^6^A as the feature set (ROC AUC = 0.844;
+Precision-Recall AUC = 0.31) [@Zhang2018]. There is evidence that chromatin
+state is strongly correlated with m6 status of transcripts, supporting a model
+of DNA binding proteins (transcription factors) recruiting METTL3/METTL14 to
+methylate the target base. Moreover, the majority m^6^AQTLs are within
+100 kb of the target base, with 46% within 100 bp (Yoruba lymphoblastoid cell
+lines)[@Zhang2020]. Long range interactions (in linear space) between DNA
+and RNA can certainly confound predictive models. Other biological confounders
+include m^6^A erasers and readers. It may be very well informative to
+predict probability of mark being erased as a feature for model of actual
+methylation. Studies in GBM have implicated antisense RNA serving as a scaffold
+for "demethylase" ALKBH5 to target marks on transcripts of FOXM1[@ZHANG2017591].
+Even newer studies suggest that FTO actually sterically prevents spurious
+methylation instead of enzymatic activity[@Koh2019]. To this end I will take a
+look at the following data to see if there are correlations in m^6^A
+status:
+
+- DNA sequence (starting with 201 bp centered at mark)
+    - Kmer (2/3-mer)
+    - Purine/Pyrimidine, Amino/Keto
+- Position in transcript (eg 5' UTR, 3' UTR, Intron, Last Exon, etc.)
+- Conservation (PhastCons, Phylop)
+- Histone Marks
+- Anti-Sense RNA Expression (hypothesis: proxy for demethylation)
+
+Moreover, I will look at the following datasets:
+
+- HEK293[@Linder2015] (used for training in Zhang et al[-@Zhang2018])
+- HEK293[@Meyer2019] (DART-Seq | Pac-Bio)
+- CD8 T cells/A549(lung epithelial carcinoma)[@Ke2015] (used for training in
+Zhao et al[-@Zhao2018])
+
+# Motif Analysis
+
+Given that 46% of m^6^AQTLs are within 100 bp of target I will
+perform motif analysis on 200 (201?) bp segments to see if there is any
+enrichment for DNA/RNA binding proteins using homer2.
+
+## DNA {.tabset}
+
+Looking at both strands of DNA. The background will be DRACH motif with a
+similar "position within gene" distribution as the actual m6A dataset
+(eg 5' UTR, coding exon, intron, 3' UTR).
+
+For m6A experiments with more than one replicate/method I will use the union of
+the replicates for motif finding (with masked genome).
+
+```{r liftOver, eval=FALSE, echo=FALSE, engine='bash'}
+/mnt/e/bioinformatics/bin/liftOver \
+raw_data/GSM1828594_precise_m6A_sites_CD8T_hg18.bed.gz \
+/mnt/e/bioinformatics/bin/hg18ToHg19.over.chain.gz \
+processed_data/GSM1828594_precise_m6A_sites_CD8T_hg19.bed \
+processed_data/GSM1828594_precise_m6A_sites_CD8T_hg18tohg19.unmapped.bed
+
+/mnt/e/bioinformatics/bin/liftOver \
+raw_data/GSM1828596_precise_m6A_sites_A549_hg18.bed.gz \
+/mnt/e/bioinformatics/bin/hg18ToHg19.over.chain.gz \
+processed_data/GSM1828596_precise_m6A_sites_A549_hg19.bed \
+processed_data/GSM1828596_precise_m6A_sites_A549_hg18tohg19.unmapped.bed
+```
+
+```{r source, results='hide'}
+source("R/20200730_m6a_project_functions.R")
+```
+
+```{r homerInput, tidy=FALSE}
+library(tidyverse)
+library(plyranges)
+
+stretch_width <- 201
+
+beds <- c("raw_data/GSE63753_hek293.abcam.CIMS.m6A.9536.bed.txt.gz",
+          "raw_data/GSE63753_hek293.sysy.CITS.m6A.12051.bed.gz",
+          "processed_data/GSM1828594_precise_m6A_sites_CD8T_hg19.bed",
+          "processed_data/GSM1828596_precise_m6A_sites_A549_hg19.bed",
+          "raw_data/GSM4568664_PacBio_2.bed.gz",
+          "raw_data/GSM4568663_PacBio_1.bed.gz",
+          "raw_data/GSM4024125_HEK293T_APOBEC1YTH_processed.bed.gz") %>%
+  map(function(x) read_tsv(x, col_names = FALSE) %>%
+        as_granges(seqnames=X1, start=X2, end=X3, strand=X6))
+
+# combine hek
+beds[8] <- beds[1:2] %>%
+  bind_ranges() %>%
+  reduce_ranges_directed()
+
+#combine hek dart
+beds[9] <- beds[5:6] %>%
+  bind_ranges() %>%
+  shift_upstream(1) %>% # bed files show location of deamination
+  reduce_ranges_directed() %>%
+  stretch(1)
+
+beds[7] <- beds[[7]] %>%
+  shift_upstream(1)
+
+sample_names <- c("cd8t_m6a.201.homer", "a549_m6a.201.homer",
+                  "hek293_dart_m6a.201.homer", "hek293_m6a.201.homer",
+                  "hek293_dart_pacbio_m6a.201.homer")
+
+beds <- beds[c(3,4,7,8,9)] %>%
+  map(~anchor_end(.) %>% mutate(width = 1))
+
+walk2(beds, sample_names, writeHomerInput)
+```
+
+```{r drachDART, echo=FALSE}
+read_bed("raw_data/GSM4024125_HEK293T_APOBEC1YTH_processed.bed.gz") %>%
+  anchor_center() %>%
+  mutate(width=25) %>%
+  as_tibble() %>%
+  mutate(id = sprintf("%s_%d_%d", seqnames, start, end)) %>%
+  dplyr::select(id, seqnames, start, end, strand) %>%
+  write_tsv('processed_data/HEK293T_APOBEC1YTH_25.homer', col_names = FALSE)
+```
+
+```{r homerDART, engine='bash', eval=FALSE, echo=FALSE}
+findMotifsGenome.pl processed_data/HEK293T_APOBEC1YTH_25.homer hg19 \
+processed_data/HEK293T_DART_RNA_25_motifs -size 25 -p 4 -len 4,5,6,7,8,9,10,11,12 \
+-rna -mask
+```
+
+
+```{r drachmotif, engine="bash", eval=FALSE, echo=FALSE}
+seq2profile.pl DRACH 0 m6a_consensus > processed_data/m6a_consensus.motif
+scanMotifGenomeWide.pl processed_data/m6a_consensus.motif hg19 -bed -mask > \
+processed_data/m6a_consensus_motif.hg19.bed
+```
+
+```{r createBackground}
+library(biomaRt)
+
+gene_elements <- c("5_utr","exon_coding","3_utr","intron","stop_codon")
+
+# Ensembl GRCh37 v 74
+df_appris <- read_tsv('E:/Genomes/hg19/appris_data.principal.txt',
+                      col_names = c('hgnc_symbol', 'ensembl_gene_id',
+                                    'ensembl_transcript_id', 'ccds', 'appris')) %>%
+  filter(appris == 'PRINCIPAL:1')
+
+# Ensembl from April 2020
+mart <- useEnsembl("ensembl", "hsapiens_gene_ensembl", GRCh = 37, version = 75)
+df_txns <- getBM(c("ensembl_transcript_id", "chromosome_name", "5_utr_start",
+                    "5_utr_end", "3_utr_start", "3_utr_end", "exon_chrom_start",
+                   "exon_chrom_end", "genomic_coding_start",
+                   "genomic_coding_end", "strand"), mart = mart) %>%
+  filter(ensembl_transcript_id %in% df_appris$ensembl_transcript_id) %>%
+  mutate(chromosome_name = sprintf("chr%s", chromosome_name)) %>%
+  group_by(ensembl_transcript_id, chromosome_name) %>%
+  arrange(ensembl_transcript_id, genomic_coding_start, .by_group = TRUE) %>%
+  group_modify(createStopCodonAttr) %>%
+  arrange(ensembl_transcript_id, genomic_coding_start, .by_group = TRUE) %>%
+  mutate(intron_start = exon_chrom_end + 1,
+         intron_end = lead(exon_chrom_start) - 1) %>%
+  dplyr::select(-c(starts_with("exon_chrom"))) %>%
+  dplyr::rename(exon_coding_start = genomic_coding_start,
+                exon_coding_end = genomic_coding_end) %>%
+  ungroup()
+
+#granges_gene_elements <- gene_elements %>%
+#  map_dfr(
+#    function(x) {df_txns %>%
+#        dplyr::select(chromosome_name, starts_with(x), strand) %>%
+#        mutate(element = x) %>%
+#        rename_with(function(x) c("seqnames","start","end","strand","element"))}
+#  ) %>%
+#  drop_na(start,end) %>%
+#  distinct() %>%
+#  filter(start <= end) %>%
+#  as_granges()
+#granges_gene_elements %>%
+#  as_tibble() %>%
+#  write_tsv('processed_data/gene_elements.GRCh37.75.tsv')
+granges_gene_elements <- read_tsv('processed_data/gene_elements.GRCh37.75.tsv') %>%
+  as_granges()
+granges_drach <- read_bed("processed_data/m6a_consensus_motif.hg19.bed") %>%
+  anchor_center() %>%
+  mutate(width = 1) %>%
+  join_overlap_intersect_directed(granges_gene_elements) 
+
+background_beds <-beds %>%
+  map(function(x) getBackground(x, granges_gene_elements, granges_drach))
+
+background_beds %>%
+  walk2(str_replace(sample_names, ".homer", ".background.homer"), writeHomerInput)
+```
+
+```{r, eval=FALSE, echo=FALSE, engine='bash'}
+for file in processed_data/*201.homer
+do
+  outdir=${file/_m6a.201.homer/_dna_motifs}
+  background=${file/.homer/.background.homer}
+  findMotifsGenome.pl $file hg19 $outdir -size 201 -p 4 \
+  -len 4,5,6,7,8,9,10,11,12 -bg $background -mask
+done
+```
+
+```{r dna_motifs, echo=FALSE, results='asis'}
+list.dirs("processed_data", recursive = FALSE) %>%
+  keep(str_detect(., "dna_motifs")) %>%
+  walk(plotHomerPngs)
+```
+
+## {.unlisted .unnumbered}
+
+I ran motif analysis originally against a normal background and observed
+the DRACH motif as most enriched in miCLIP datasets but not in DART-seq. My
+understanding is that the bed files denote the C in DRACH and therefore
+DRACH should be in the center of my sequences. I am leaning towards not including
+DART-seq in modeling experiments.
+
+## RNA {.tabset}
+
+For this step I'll compare de novo RNA motifs with motifs of RNA binding
+proteins. The motifs for RNA binding proteins was derived from eCLIP ENCODE
+data with Homer2 (mask, size=75 bp) using the top 2 motifs $(P < 1e-10)$.
+
+```{r rnahomer, engine="bash", eval=FALSE}
+for file in processed_data/*201.homer
+do
+  outdir=${file/_m6a.201.homer/_rna_motifs}
+  background=${file/.homer/.background.homer}
+  findMotifsGenome.pl $file hg19 $outdir -size 201 -p 4 -rna \
+  -mknown /mnt/e/bioinformatics/homer/motifs/rna/20200722_eclip.motif \
+  -len 4,5,6,7,8,9,10,11,12 -bg $background -mask
+done
+```
+
+```{r rnahomer2, engine="bash", eval=FALSE}
+for file in processed_data/*201.homer
+do
+  outdir=${file/_m6a.201.homer/_rna_motifs2}
+  background=${file/.homer/.background.homer}
+  motif=/mnt/e/bioinformatics/homer/motifs/rna/20200722_eclip.motif
+  findMotifsGenome.pl $file hg19 $outdir -size 201 -p 4 -norevopp -nomotif \
+  -mknown $motif -bg $background -mask
+done
+```
+
+```{r rna_motifs, echo=FALSE, results='asis'}
+list.dirs("processed_data", recursive = FALSE) %>%
+  keep(~str_detect(., "rna_motifs$")) %>%
+  walk(plotHomerPngs)
+```
+
+## {.unlisted .unnumbered}
+
+I could not figure out how to get Homer2 to compare against my motif file. It
+is a little weird that DRACH motif is enriched? This wasn't the case for DNA.
+Maybe there is more to m^6^A motif than DRACH.
+
+# Kmer Analysis {.tabset}
+
+Get 1,2,3mer counts as well as GC content, purine content (AG), amino content
+ (AC) and compare levels between m6A and 
+background
+
+```{r kmer, fig.width=20, fig.height=6, results='asis', dpi=300}
+m6a_samples <- c("CD8T", "A549", "HEK Dart", "HEK miCLIP", "HEK Dart Pac Bio")
+
+beds2 <- map2(
+  beds,
+  background_beds,
+  ~{bind_ranges(.x %>% mutate(group="m6A") %>% plyranges::select(group),
+                .y %>% mutate(group="background") %>% plyranges::select(group))}
+) %>%
+  walk2(m6a_samples,~getSurroundingSeqPlots(.x, .y, stretch_width))
+```
+
+# {.unlisted .unnumbered}
+
+The main thing I observe is lack of T-rich kmers and overall GC enrichment
+in the neighborhood of DRm^6^ACH sequences. From this analysis, I am leaning
+towards recognition of RNA secondary structure by the methylase complex rather
+than DNA binding protein recruitment. One could argue that I should have
+controlled for GC content when creating the background. I would think that by
+controlling for position within a gene, on average GC content would be similar.
+Maybe this reflects true biology...
+
+# Histone Marks {.tabset}
+
+For histone marks I think I will use
+[replicated/stable peaks](https://www.encodeproject.org/chip-seq/histone/#outputs).
+For background sequences, I am using the same background that was used for
+motif enrichment. Enrichment will be determined via fisher's test. I could have
+done logistic regression with methylation status as response to get OR as well,
+but I am assuming the stats are similar...
+
+|| Background DRACH | DRm^6^ACH |
+| --- | --- | --- |
+| **No Histone Mark** | a | b |
+| **Histone Mark** | c | d |
+
+$$OR = \frac{ad}{cb}$$
+
+This is same OR as if I actually set up the table in conventional format. 
+
+Also I am only looking at 2500 observations from m6A and background samples.
+
+```{r intersectReps}
+df_meta <- read_tsv("raw_data/metadata.tsv") %>%
+  dplyr::select_if(~sum(!is.na(.)) > 0) %>%
+  filter(`File assembly` == "hg19", `File Status` == "released",
+         `Output type` != "peaks")
+
+encode_beds <- df_meta %>%
+  group_by(`Biosample term name`, `Experiment target`) %>%
+  group_map(~mergeDonors(.x, .y$`Biosample term name`, .y$`Experiment target`))
+```
+
+
+```{r mergeENCODEmiCLIP}
+dfs <- map2(
+  map2(beds %>% map(sample_granges),
+       c("CD8", "A549","HEK","HEK","HEK"),
+       ~makeMasterTable(.x, .y, encode_beds)),
+  map2(background_beds %>% map(sample_granges),
+       c("CD8", "A549","HEK","HEK","HEK"),
+       ~makeMasterTable(.x, .y, encode_beds)),
+  function(x,y){
+    bind_rows(x %>% mutate(group="m6A"),
+              y %>% mutate(group="Background")) %>%
+      mutate(pos_group = cut_interval(pos, length = 50, closed = "left"))
+  }
+)
+```
+
+```{r graphHistones, results='asis'}
+walk2(dfs, m6a_samples, 
+      ~plotGroupAnnotwHeader(df = .x, cell = .y, to_keep = "human", FUN = plotHistoneOR))
+```
+
+# {.unlisted .unnumbered}
+
+The enrichment in H3K27ac regions is very strong, although only 1 in 10 m6A
+sites are actually within H3k27ac peaks in most samples. The enrichment of 
+H3K36me3 is very strong.
+
+TODO: Read H3K36me3
+
+# Conservation {.tabset}
+
+Using the same bed files used for motif analysis, I will try to see if there
+is any positional trends for conservation scores using phastCons and phyloP.
+I'll compare distributions between background and m6A samples using
+Mann-Whitney test.
+
+>PhastCons is sensitive to "runs" of conserved sites, and is therefore effective
+for picking out conserved elements. PhyloP, on the other hand, is more
+appropriate for evaluating signatures of selection at particular nucleotides or
+classes of nucleotides (e.g., third codon positions, or first positions of miRNA
+target sites).
+
+```{r conservation, results='asis'}
+walk2(dfs, m6a_samples,
+      ~plotGroupAnnotwHeader(df = .x, cell = .y, to_keep = "phylo|phast", FUN = plotConservation))
+```
+
+# {.unlisted .unnumbered}
+
+In general we see that the neighborhood around m6A sites is generally more
+conserved than background DRACH sites. It must be noted that these DRACH sites
+are located within gene bodies, so the increased conservation is not merely
+due to genes being conserved. 
+
+# AS RNA {.tabset}
+
+I was only successfuly only able to download HEK293 RNA seq from NCBI. I used
+control fastqs from Chen et al[-@Chen2017] and calculated TPM using Salmon.
+The reference index was generated from Ensembl GRCh 37. The goal is to ask if 
+there is enrichment of expression of anti sense RNAs in the background DRACH
+sites compared to the actual m6A. If so the model of demethylase guided to DRACH
+via AS RNA is still plausible. 
+
+```{r asrna, results='asis'}
+df_tpm <- read_tsv("processed_data/quants/hek293/quant.sf") %>%
+  filter(TPM > 0.1)
+
+granges_coords <- getBM(c("ensembl_transcript_id", "chromosome_name",
+                     "transcript_start","transcript_end",
+                     "strand"), mart = mart) %>%
+  inner_join(df_tpm, by=c("ensembl_transcript_id"="Name")) %>%
+  mutate(Strand = strand,
+         chromosome_name = sprintf("chr%s", chromosome_name)) %>%
+  as_granges(seqnames=chromosome_name, start=transcript_start,
+             end=transcript_end)
+
+pwalk(list(beds[3:5], background_beds[3:5], m6a_samples[3:5]), getASEnrichment)
+```
+
+# {.unlisted .unnumbered}
+
+The opposite occurred. The AS RNA may be enriched for m6A instead of depleted.
+
+# Final Thoughts
+
+For the actual model I will look at DNA features as well as conservation.
+Histone marks just appear to be associated with transcribed genes.
+Maybe other CHIP-Seq data should be employed. The DART-Seq samples are confusing
+as DRACH is not observed as enriched motif (data not shown). Anti sense RNA
+doesn't appear to be relevant in HEKs.
+
+# References
+
+<div id="refs"></div>
+
+# Session Info
+
+```{r sessionInfo, echo=FALSE}
+sessionInfo()
+```
